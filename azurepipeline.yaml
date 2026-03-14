@@ -1,0 +1,118 @@
+trigger:
+- main
+
+pool:
+  name: devsecops
+
+variables:
+  imageName: boardgame-app
+  acrName: youracrname.azurecr.io
+  aksResourceGroup: hackathon-rg01
+  aksClusterName: hackathon-aks
+
+stages:
+
+# ==========================
+# Stage 1 - Maven Build
+# ==========================
+- stage: Build
+  displayName: Maven Build
+  jobs:
+  - job: MavenBuild
+    steps:
+
+    - task: Maven@3
+      displayName: Build Java Application
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'clean package'
+        options: '-DskipTests'
+
+# ==========================
+# Stage 2 - SonarQube Scan
+# ==========================
+- stage: SonarQube
+  displayName: Code Quality Scan
+  dependsOn: Build
+  jobs:
+  - job: SonarScan
+    steps:
+
+    - task: SonarQubePrepare@5
+      inputs:
+        SonarQube: 'sonarqube-service'
+        scannerMode: 'CLI'
+        configMode: 'file'
+
+    - script: mvn sonar:sonar
+      displayName: Run SonarQube Scan
+
+    - task: SonarQubePublish@5
+      inputs:
+        pollingTimeoutSec: '300'
+
+# ==========================
+# Stage 3 - Docker Build
+# ==========================
+- stage: Docker
+  displayName: Build Docker Image
+  dependsOn: SonarQube
+  jobs:
+  - job: DockerBuild
+    steps:
+
+    - script: |
+        docker build -t $(imageName):latest .
+      displayName: Build Docker Image
+
+# ==========================
+# Stage 4 - Trivy Scan
+# ==========================
+- stage: SecurityScan
+  displayName: Trivy Security Scan
+  dependsOn: Docker
+  jobs:
+  - job: Trivy
+    steps:
+
+    - script: |
+        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+        aquasec/trivy image $(imageName):latest
+      displayName: Scan Docker Image
+
+# ==========================
+# Stage 5 - Push to ACR
+# ==========================
+- stage: PushImage
+  displayName: Push Image to ACR
+  dependsOn: SecurityScan
+  jobs:
+  - job: Push
+    steps:
+
+    - script: |
+        az acr login --name $(acrName)
+
+        docker tag $(imageName):latest $(acrName)/$(imageName):latest
+        docker push $(acrName)/$(imageName):latest
+      displayName: Push Image to ACR
+
+# ==========================
+# Stage 6 - Deploy to AKS
+# ==========================
+- stage: Deploy
+  displayName: Deploy to AKS
+  dependsOn: PushImage
+  jobs:
+  - job: DeployToAKS
+    steps:
+
+    - script: |
+        az aks get-credentials \
+        --resource-group $(aksResourceGroup) \
+        --name $(aksClusterName) \
+        --overwrite-existing
+
+        kubectl apply -f k8s/deployment.yaml
+        kubectl apply -f k8s/service.yaml
+      displayName: Deploy Application
